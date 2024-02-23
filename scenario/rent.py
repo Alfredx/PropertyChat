@@ -1,23 +1,25 @@
-from fuzzywuzzy import process
+import json
 from typing import Dict
 
 import arrow
 import autogen
 import pandas as pd
+import requests
 import streamlit as st
 from autogen import AssistantAgent, UserProxyAgent
+from fuzzywuzzy import process
 from typing_extensions import Annotated
 
 from scripts.transform import transform2texttable
 
-from .agents import (TrackableAssistantAgent, TrackableGroupChatManager,
-                     TrackableUserProxyAgent)
+from .agents import (ChatMessage, TrackableAssistantAgent,
+                     TrackableGroupChatManager, TrackableUserProxyAgent)
 from .agents import llm_config as llm_config
 from .agents import llm_config_gpt3
 
 
 def is_termination_msg(msg):
-    content:str = msg.get("content", "")
+    content: str = msg.get("content", "")
     if not content:
         return False
     return "terminate" in content.lower()
@@ -153,11 +155,32 @@ def initiate_chats(message):
     print(result.cost)
 
 
+class BingSearch(object):
+    def __init__(self) -> None:
+        self.sub_key = st.secrets["BING_SEARCH_SUB_KEY"]
+        self._headers = {"Ocp-Apim-Subscription-Key": self.sub_key}
+        self._params = {"q": "", "textDecorations": True,
+                        "textFormat": "HTML", "mkt": "zh-CN"}
+        self._search_url = "https://api.bing.microsoft.com/v7.0/news/search"
 
+    def search(self, q, mkt="zh-CN"):
+        if not q:
+            return []
+        self._params["q"] = q
+        self._params["mkt"] = mkt
+        self._params["category"] = "Business"
+        self._params["sortBy"] = "Relevance"
+        response = requests.get(
+            self._search_url, headers=self._headers, params=self._params)
+        response.raise_for_status()
+        return response.json()
 
 
 def chat_on_info(message):
-    user_proxy = TrackableUserProxyAgent(
+    with st.chat_message("user"):
+        st.markdown(message)
+        st.session_state.messages.append(ChatMessage("user", message))
+    user_proxy = UserProxyAgent(
         name="Admin",
         human_input_mode="NEVER",
         system_message="A human that will provide the necessary information to the group chat manager. Execute the function decided by the QueryAssistant and report the result. Reply TERMINATE when you think everything is done.",
@@ -169,33 +192,55 @@ def chat_on_info(message):
             "use_docker": False,
         },  # Please set use_docker=True if docker is available to run the generated code. Using docker is safer than running the generated code directly.
     )
-    analyst = TrackableAssistantAgent(
+    analyst = AssistantAgent(
         name="Analyst",
-        llm_config=llm_config_gpt3,
+        llm_config=llm_config,
         is_termination_msg=lambda x: x.get("content", "") and x.get(
             "content", "").rstrip().endswith("TERMINATE"),
-        system_message="""You are a professional Data Analyst.
-        You use your excellent coding and language skill to answer questions.
-        Reply TERMINATE when everything is done."""
+        system_message="""你是一个十分有用的助理。你可以理解表格信息和json格式的信息。
+        用户会问你他想了解的公司，你需要遵循以下指示：
+        1. 使用提供给你的工具搜索公司基础信息和公司的新闻。
+        2. 分开回答公司信息和新闻。
+        3. 确保你所回答的公司信息中至少包含：所属行业，参保人数，联系电话，电子邮箱，最新地址，当前写字楼，单元面积，上次装修工程完成时间。
+        4. 确保你所回答的新闻中保留新闻地址引用（url）。
+        4. 回答完毕时，在最后回复：TERMINATE
+        这对我来说非常重要，你一定要认真回答。
+    """
     )
 
     @user_proxy.register_for_execution()
-    @analyst.register_for_llm(description="Use this function to fetch certain company's information.")
-    def company_info(name: Annotated[str, "company name or 公司名称"]) -> str:
+    @analyst.register_for_llm(description="用这个工具来搜索公司的基础信息")
+    def company_info(name: Annotated[str, "公司名称"]) -> str:
         df: pd.DataFrame = st.session_state.df_full
         df_filtered = df[df["公司名称"].str.contains(name)]
         output = process.extract(name, df['公司名称'], limit=1)
         if output:
             company_name = output[0][0]
-            df_filtered = df[df["公司名称"]==company_name]
+            df_filtered = df[df["公司名称"] == company_name]
             return transform2texttable(df_filtered)
         return ""
-    
-    user_proxy.initiate_chat(
+
+    @user_proxy.register_for_execution()
+    @analyst.register_for_llm(description="使用这个工具来搜索公司的新闻")
+    def search_company(name: Annotated[str, "公司名称"]) -> str:
+        search = BingSearch()
+        result = search.search(f"公司最新动态：{name}")
+        # json: "value" > 0 > name | url | description
+        if values := result.get("value", []):
+            return json.dumps(values[:5], indent=4)
+        return ""
+
+    chat_result = user_proxy.initiate_chat(
         analyst,
-        is_termination_msg=lambda x: True,
+        is_termination_msg=is_termination_msg,
         message=message
     )
+    if history := chat_result.chat_history:
+        with st.chat_message("assistant"):
+            st.markdown(history[-1]['content'])
+            st.session_state.messages.append(
+                ChatMessage("assistant", history[-1]['content']))
+    return None
 
 
 if __name__ == "__main__":
