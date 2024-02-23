@@ -1,47 +1,24 @@
-import random
-import time
-from dataclasses import dataclass
-
-import requests
-import streamlit as st
-from openai import OpenAI
 import pandas as pd
-from scripts.transform import transform2texttable
+import streamlit as st
 
-st.title("Property Chat")
+from scenario.agents import ChatMessage
+from scenario.intention_checkbot import intention_check
+from scenario.rent import chat_on_info
+from scenario.rent_step_by_step import rent_step_by_step
 
-@dataclass
-class ChatMessage(object):
-    role: str = ""
-    content: str = ""
+st.set_page_config(page_title="Property Chat", layout="wide")
 
-
-def get_response(prompt):
-    def response_generator():
-        response = random.choice(
-            [
-                "Hello there! How can I assist you today?",
-                "Hi, human! Is there anything I can help you with?",
-                "Do you need help?",
-                f"Your prompt is {prompt}"
-            ]
-        )
-        for word in response.split():
-            yield word + " "
-            time.sleep(0.05)
-    return response_generator()
-
-
-client = OpenAI(**{
-    "api_key": st.secrets["OPENAI_API_KEY"],
-    "base_url": st.secrets["OPENAI_BASE_URL"]
-})
 
 if "messages" not in st.session_state:
-    st.session_state.messages: list[ChatMessage] = []
+    st.session_state.messages = []
 
-if "file_record" not in st.session_state:
-    st.session_state.file_record: pd.DataFrame = None
+if "df" not in st.session_state:
+    df = pd.read_excel("zjw_based_companies_slim.xlsx")
+    st.session_state.df = df
+    st.session_state.current_df = df
+    df_full = pd.read_excel("zjw_based_companies.xlsx")
+    st.session_state.df_full = df_full
+
 
 if "file_processing" not in st.session_state:
     st.session_state.file_processing: bool = False
@@ -49,48 +26,52 @@ if "file_processing" not in st.session_state:
 if "llm_model" not in st.session_state:
     st.session_state.llm_model = "gpt-4-turbo"
 
+if "new_user_input" not in st.session_state:
+    st.session_state.new_user_input = False
+
 
 for message in st.session_state.messages:
     with st.chat_message(message.role):
         st.markdown(message.content)
 
-if prompt := st.chat_input("你可以这么问我：哪几家公司最有可能要更换办公室？"):
-    st.chat_message("user").markdown(prompt)
-    if (df := st.session_state.file_record) is not None:
-        st.session_state.messages.append(ChatMessage(role="user", content=prompt))
-        # print(transform2texttable(df[:50]))
-        with st.chat_message("assistant"):
-            stream = client.chat.completions.create(
-                model=st.session_state.llm_model,
-                messages= [{"role": "system", "content": f"表格内容如下: \n{transform2texttable(df[:100])}\n\n" + 
-                            "首先根据表格内容中的“招聘岗位增幅（%）”一列筛选出增幅最大的前10家公司，然后根据筛选结果回答用户问题。"+
-                            "如果给出的答案包含具体的公司，那么也要从表格中一起带出公司联系电话和邮箱。do it step by step."},] +
-                [
-                    {"role": m.role, "content": m.content}
-                    for m in st.session_state.messages[-1:]
-                ],
-                stream=True,
-            )
-            response = st.write_stream(stream)
-    # with st.chat_message("assistant"):
-    #     response = f"Echo {prompt}"
-    #     st.markdown(response)
+initial_message = """您好，我是您专属的出租顾问。您可以这么问我：
 
-            st.session_state.messages.append(ChatMessage("assistant", response))
+如：我有一套位于尚嘉中心的办公单元要出租，面积共2000平米，请帮我找到合适的租户。
+
+或者您也可以这么问：
+                     
+告诉我有关乐歌信息科技（上海）有限公司这家公司的更多信息。"""
+with st.chat_message("assistant"):
+    st.markdown(initial_message)
+
+if prompt := st.chat_input(":>", key="chat_input"):
+
+    # st.chat_message("user").markdown(prompt)
+    # st.session_state.messages.append(ChatMessage(role="user", content=prompt))
+    intention = intention_check(prompt)
+    if intention == "RENT":
+        st.session_state.current_df = st.session_state.df
+        # initiate_chats(prompt)
+        rent_step_by_step(prompt)
+    elif intention == "INFO":
+        chat_on_info(prompt)
     else:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.messages.append(
+            ChatMessage(role="user", content=prompt))
         with st.chat_message("assistant"):
-            if file_processing := st.session_state.file_processing:
-                st.write("[正在预处理数据文件，请稍候...]")
-            else:
-                st.write("在我回答您的问题之前，请在侧边栏上传数据文件。\n\n例如《2023年12月陆家嘴核心区域.xlsx》")
+            st.markdown(initial_message)
+            st.session_state.messages.append(ChatMessage(
+                role="assistant", content=initial_message))
 
-with st.sidebar:
-    if uploaded_file := st.file_uploader("Choose a file", type=["xlsx", "xls"]):
-        st.session_state.file_processing = True
-        df = pd.read_excel(uploaded_file)
-        st.session_state.file_record = df
-        st.session_state.file_processing = False
 
-    llm_model = st.radio("大语言模型", ["gpt-4-turbo", "gpt-3.5-turbo"])
-    st.session_state.llm_model = llm_model
+# with st.sidebar:
+#     if uploaded_file := st.file_uploader("Choose a file", type=["xlsx", "xls"]):
+#         st.session_state.file_processing = True
+#         df = pd.read_excel(uploaded_file)
+#         st.session_state.file_record = df
+#         st.session_state.file_processing = False
 
+#     llm_model = st.radio("大语言模型", ["gpt-4-turbo", "gpt-3.5-turbo"])
+#     st.session_state.llm_model = llm_model
